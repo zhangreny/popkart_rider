@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-*.log
-stop.loop
-debug_*.png
-crop_*.png
-.venv/
-venv/
-.env
