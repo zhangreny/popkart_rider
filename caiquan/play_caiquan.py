@@ -202,7 +202,13 @@ def move_and_click(abs_x, abs_y):
         y = int(round(cur_y + (abs_y - cur_y) * eased))
         if not ctypes.windll.user32.SetCursorPos(x, y):
             time.sleep(0.02)
-            win32api.SetCursorPos((x, y))
+            try:
+                win32api.SetCursorPos((x, y))
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to move the mouse cursor. Run this script from an elevated "
+                    "PowerShell window if PopKart Client is running as administrator."
+                ) from exc
         time.sleep(0.008)
     time.sleep(0.06)
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, abs_x, abs_y, 0, 0)
