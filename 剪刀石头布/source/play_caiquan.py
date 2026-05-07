@@ -15,7 +15,8 @@ from PIL import ImageGrab
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 WORK_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-DISPLAY_ID = "DELD1EE"
+WINDOW_TITLE = "PopKart Client"
+FALLBACK_DISPLAY_ID = "DELD1EE"
 STOP_FILE = WORK_DIR / "stop.loop"
 
 MOVE_BEATS = {
@@ -29,6 +30,7 @@ USER_TEMPLATE = {
     "shitou": "user-shitou.png",
     "bu": "user-bu.png",
 }
+USER_TEMPLATE_NAMES = {move: filename.replace(".png", "") for move, filename in USER_TEMPLATE.items()}
 
 
 @dataclass
@@ -55,20 +57,51 @@ def set_dpi_awareness():
             pass
 
 
-def find_display_rect(display_id=DISPLAY_ID):
+def display_device_id(device):
+    ids = []
+    index = 0
+    while True:
+        try:
+            details = win32api.EnumDisplayDevices(device, index)
+        except Exception:
+            break
+        if details.DeviceID:
+            ids.append(details.DeviceID)
+        index += 1
+    return " | ".join(ids) or device
+
+
+def find_popkart_hwnd():
+    return win32gui.FindWindow(None, WINDOW_TITLE)
+
+
+def find_window_display_rect():
+    hwnd = find_popkart_hwnd()
+    if not hwnd:
+        return None, None
+    hmon = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    info = win32api.GetMonitorInfo(hmon)
+    return info["Monitor"], display_device_id(info["Device"])
+
+
+def find_display_rect(display_id=FALLBACK_DISPLAY_ID):
     for hmon, _hdc, _rect in win32api.EnumDisplayMonitors():
         info = win32api.GetMonitorInfo(hmon)
         device = info["Device"]
-        index = 0
-        while True:
-            try:
-                details = win32api.EnumDisplayDevices(device, index)
-            except Exception:
-                break
-            if display_id.upper() in details.DeviceID.upper():
-                return info["Monitor"]
-            index += 1
+        if display_id.upper() in display_device_id(device).upper():
+            return info["Monitor"]
     raise RuntimeError(f"Could not find display containing {display_id!r}")
+
+
+def find_target_display_rect():
+    rect, device_id = find_window_display_rect()
+    if rect:
+        print(f"{WINDOW_TITLE} display: {device_id}; rect={rect}", flush=True)
+        return rect
+
+    rect = find_display_rect()
+    print(f"fallback display {FALLBACK_DISPLAY_ID}: {rect}", flush=True)
+    return rect
 
 
 def virtual_origin():
@@ -107,6 +140,12 @@ TEMPLATES = {
     "user-jiandao": load_template("user-jiandao.png", top_ratio=0.72),
     "user-shitou": load_template("user-shitou.png", top_ratio=0.72),
     "user-bu": load_template("user-bu.png", top_ratio=0.72),
+}
+
+
+USER_CARD_FULL_HEIGHTS = {
+    name: cv2.imread(str(RESOURCE_DIR / filename), cv2.IMREAD_COLOR).shape[0]
+    for name, filename in USER_TEMPLATE.items()
 }
 
 
@@ -192,6 +231,140 @@ def all_matches(image, name, threshold=0.78, region=None, min_distance=45):
     return kept
 
 
+def user_card_search_region(image):
+    h, w = image.shape[:2]
+    return 0, int(h * 0.55), w, h
+
+
+def find_user_card(image, move):
+    return best_match(image, USER_TEMPLATE_NAMES[move], region=user_card_search_region(image))
+
+
+def column_groups(mask, min_pixels=1, merge_gap=3):
+    columns = np.where(mask.sum(axis=0) >= min_pixels)[0]
+    if len(columns) == 0:
+        return []
+
+    groups = []
+    start = int(columns[0])
+    previous = int(columns[0])
+    for column in columns[1:]:
+        column = int(column)
+        if column - previous <= merge_gap + 1:
+            previous = column
+            continue
+        groups.append((start, previous))
+        start = previous = column
+    groups.append((start, previous))
+    return groups
+
+
+def has_inner_hole(mask):
+    if mask.size == 0:
+        return False
+
+    padded = np.pad(mask.astype(np.uint8), 1, mode="constant", constant_values=0)
+    background = (padded == 0).astype(np.uint8)
+    flood = background.copy()
+    stack = []
+    height, width = flood.shape
+    for x in range(width):
+        if flood[0, x]:
+            stack.append((x, 0))
+        if flood[height - 1, x]:
+            stack.append((x, height - 1))
+    for y in range(height):
+        if flood[y, 0]:
+            stack.append((0, y))
+        if flood[y, width - 1]:
+            stack.append((width - 1, y))
+
+    while stack:
+        x, y = stack.pop()
+        if not flood[y, x]:
+            continue
+        flood[y, x] = 0
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < width and 0 <= ny < height and flood[ny, nx]:
+                stack.append((nx, ny))
+
+    return int(flood.sum()) >= 4
+
+
+def user_count_text_mask(crop):
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _threshold, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    mask = (mask > 0).astype(np.uint8)
+
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    cleaned = np.zeros_like(mask)
+    for index in range(1, count):
+        x, y, width, height, area = stats[index]
+        if 2 <= width <= 28 and 6 <= height <= 24 and 5 <= area <= 220:
+            cleaned[y : y + height, x : x + width] = mask[y : y + height, x : x + width]
+    return cleaned
+
+
+def user_card_count_is_zero(image, move, match):
+    full_height = USER_CARD_FULL_HEIGHTS[move]
+    h, w = image.shape[:2]
+    x1 = max(0, match.x)
+    x2 = min(w, match.x + match.w)
+    y1 = max(0, match.y + int(full_height * 0.90))
+    y2 = min(h, match.y + full_height + 48)
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return False, "empty-crop"
+
+    mask = user_count_text_mask(crop)
+    row_counts = mask.sum(axis=1)
+    active_rows = np.where(row_counts >= 2)[0]
+    if len(active_rows) == 0:
+        return False, "no-text"
+
+    text_y1 = max(0, int(active_rows[0]) - 1)
+    text_y2 = min(mask.shape[0], int(active_rows[-1]) + 2)
+    text_mask = mask[text_y1:text_y2, :]
+    groups = [(start, end) for start, end in column_groups(text_mask, merge_gap=3) if end - start + 1 >= 2]
+    if not groups:
+        return False, "no-groups"
+
+    last_start, last_end = groups[-1]
+    last = text_mask[:, last_start : last_end + 1]
+    previous_gap = last_start - groups[-2][1] if len(groups) >= 2 else 999
+    last_width = last_end - last_start + 1
+    last_height = int(np.count_nonzero(last.sum(axis=1)))
+    zero_shape = has_inner_hole(last) and 5 <= last_width <= 18 and 8 <= last_height <= 24
+    single_digit_after_x = previous_gap >= 6
+    details = f"groups={groups} gap={previous_gap} size={last_width}x{last_height} zero={zero_shape}"
+    return bool(zero_shape and single_digit_after_x), details
+
+
+def detect_empty_user_cards(rect, image=None, min_score=0.50):
+    if image is None:
+        image = screenshot_display(rect)
+
+    empty = []
+    details = []
+    for move in ("jiandao", "shitou", "bu"):
+        match = find_user_card(image, move)
+        if match.score < min_score:
+            details.append(f"{move}:match={match.score:.3f}/skip")
+            continue
+        is_zero, reason = user_card_count_is_zero(image, move, match)
+        details.append(f"{move}:match={match.score:.3f} {reason}")
+        if is_zero:
+            empty.append(move)
+    return empty, "; ".join(details)
+
+
+def should_stop_for_empty_card(rect, image=None):
+    empty, details = detect_empty_user_cards(rect, image)
+    print(f"stock check: empty={empty} {details}", flush=True)
+    return bool(empty)
+
+
 def move_and_click(abs_x, abs_y):
     abs_x = int(abs_x)
     abs_y = int(abs_y)
@@ -240,7 +413,7 @@ def wait_for_match(rect, name, threshold=0.78, timeout=12, region=None, poll=0.2
 
 
 def find_popkart_rect():
-    hwnd = win32gui.FindWindow(None, "PopKart Client")
+    hwnd = find_popkart_hwnd()
     if not hwnd:
         return None
     return win32gui.GetWindowRect(hwnd)
@@ -626,7 +799,7 @@ def dismiss_after_stage(rect, stage, move):
 
 
 def focus_popkart():
-    hwnd = win32gui.FindWindow(None, "PopKart Client")
+    hwnd = find_popkart_hwnd()
     if hwnd:
         try:
             win32gui.SetForegroundWindow(hwnd)
@@ -640,6 +813,10 @@ def run_once(rect, run_number=1):
     time.sleep(0.4)
 
     image = screenshot_display(rect)
+    if should_stop_for_empty_card(rect, image):
+        print("run stopped: at least one user card count is zero", flush=True)
+        return True
+
     confirm = find_reward_confirm_button(rect, image)
     if confirm:
         print(f"reward confirm visible at run start: {confirm.center}", flush=True)
@@ -666,6 +843,10 @@ def run_once(rect, run_number=1):
         attempts += 1
         image, stage, stage_match = wait_for_stage(rect, timeout=10)
         print(f"current stage={stage} stage-row={stage_match.center}", flush=True)
+        if should_stop_for_empty_card(rect, image):
+            print("run stopped: at least one user card count is zero", flush=True)
+            return True
+
         if stage > 5:
             no = best_match(image, "no")
             yes = best_match(image, "yes")
@@ -693,10 +874,9 @@ def run_once(rect, run_number=1):
         printable = ", ".join(f"{m.name}:{m.score:.3f}@{m.center}" for m in matches)
         print(f"stage {stage}: opponents=[{printable}] choose={move}", flush=True)
 
-        user_name = USER_TEMPLATE[move].replace(".png", "")
-        user_match = best_match(image, user_name)
+        user_match = find_user_card(image, move)
         if user_match.score < 0.55:
-            raise RuntimeError(f"Could not find user card {user_name}; best score={user_match.score:.3f}")
+            raise RuntimeError(f"Could not find user card {USER_TEMPLATE_NAMES[move]}; best score={user_match.score:.3f}")
         click_match(rect, user_match, f"user {move}")
         time.sleep(2)
 
@@ -706,11 +886,13 @@ def run_once(rect, run_number=1):
             break
 
     print(f"run {run_number}: done", flush=True)
+    return False
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--loop", action="store_true", help="repeat runs until stop.loop exists or max-runs is reached")
+    parser.add_argument("--loop", action="store_true", help="compatibility option; runs repeat by default")
+    parser.add_argument("--once", action="store_true", help="run one round only")
     parser.add_argument("--max-runs", type=int, default=0, help="maximum loop runs; 0 means unlimited")
     parser.add_argument("--loop-delay", type=float, default=4.0, help="seconds to wait between loop runs")
     return parser.parse_args()
@@ -719,16 +901,20 @@ def parse_args():
 def main():
     args = parse_args()
     set_dpi_awareness()
-    rect = find_display_rect()
-    print(f"display {DISPLAY_ID}: {rect}", flush=True)
+    rect = find_target_display_rect()
 
     if STOP_FILE.exists():
         STOP_FILE.unlink()
 
     run_number = 1
     while True:
-        run_once(rect, run_number)
-        if not args.loop:
+        if should_stop_for_empty_card(rect):
+            print("loop: at least one user card count is zero", flush=True)
+            break
+        stopped_for_empty_card = run_once(rect, run_number)
+        if stopped_for_empty_card:
+            break
+        if args.once:
             break
         if args.max_runs and run_number >= args.max_runs:
             print(f"loop: reached max-runs={args.max_runs}", flush=True)
